@@ -20,6 +20,7 @@ npm-debug.log*
 .DS_Store
 Thumbs.db
 .vscode/
+
 .idea/
 
 # Temporary files & tests
