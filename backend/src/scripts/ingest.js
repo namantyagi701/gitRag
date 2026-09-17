@@ -5,8 +5,21 @@ const path = require("path");
 const crypto = require("crypto");
 require("dotenv").config({ path: path.join(__dirname, "..", "..", ".env") });
 const { PrismaClient } = require("@prisma/client");
+const Parser = require("tree-sitter");
+const JavaScript = require("tree-sitter-javascript");
+const TypeScript = require("tree-sitter-typescript");
 
 const prisma = new PrismaClient();
+
+// Initialize parsers for JS, TS, and TSX
+const jsParser = new Parser();
+jsParser.setLanguage(JavaScript);
+
+const tsParser = new Parser();
+tsParser.setLanguage(TypeScript.typescript);
+
+const tsxParser = new Parser();
+tsxParser.setLanguage(TypeScript.tsx);
 
 // Directories to ignore during traversal
 const IGNORED_DIRS = new Set([
@@ -30,7 +43,7 @@ const IGNORED_DIRS = new Set([
   ".devin"
 ]);
 
-// File extensions considered source code
+// File extensions considered source code (tracked in files table)
 const CODE_EXTENSIONS = new Set([
   ".js", ".jsx", ".mjs", ".cjs",
   ".ts", ".tsx", ".mts", ".cts",
@@ -52,14 +65,40 @@ const CODE_EXTENSIONS = new Set([
   ".json", ".yaml", ".yml", ".toml", ".md"
 ]);
 
-// Non-code/markup/config extensions that do not produce function/class AST symbols
+// Extensions where symbol extraction is not applicable (configs, styles, docs)
 const NON_SYMBOL_EXTENSIONS = new Set([
   ".json", ".yaml", ".yml", ".toml", ".md",
   ".html", ".css", ".scss", ".sass", ".less"
 ]);
 
+// Extensions currently supported for Tree-sitter AST symbol extraction
+const SUPPORTED_SYMBOL_EXTENSIONS = new Set([
+  ".js", ".jsx", ".mjs", ".cjs",
+  ".ts", ".tsx", ".mts", ".cts"
+]);
+
 /**
- * Compute SHA-256 hash of file content
+ * Select the appropriate Tree-sitter parser based on file extension
+ */
+function getParserForExtension(ext) {
+  switch (ext) {
+    case ".ts":
+    case ".mts":
+    case ".cts":
+      return tsParser;
+    case ".tsx":
+      return tsxParser;
+    case ".js":
+    case ".jsx":
+    case ".mjs":
+    case ".cjs":
+    default:
+      return jsParser;
+  }
+}
+
+/**
+ * Compute SHA-256 hash of a string
  */
 function computeHash(content) {
   return crypto.createHash("sha256").update(content).digest("hex");
@@ -101,10 +140,137 @@ function collectCodeFiles(dirPath, rootPath, fileList = []) {
 }
 
 /**
- * Parse CLI arguments:
- * Supports:
- *   node src/scripts/ingest.js <path-to-repo> <owner> <name>
- *   node src/scripts/ingest.js <path-to-repo> <owner/name>
+ * Extract docstring/comment block immediately preceding a node without any blank lines
+ */
+function extractPrecedingComment(node, lines) {
+  // Ascend parent wrappers (export_statement, variable_declaration, etc.)
+  let targetNode = node;
+  while (
+    targetNode.parent &&
+    (targetNode.parent.type === "export_statement" ||
+     targetNode.parent.type === "lexical_declaration" ||
+     targetNode.parent.type === "variable_declaration")
+  ) {
+    targetNode = targetNode.parent;
+  }
+
+  const startRow = targetNode.startPosition.row;
+  const commentLines = [];
+  let currentRow = startRow - 1;
+
+  while (currentRow >= 0) {
+    const lineTrimmed = lines[currentRow].trim();
+    if (lineTrimmed === "") {
+      break; // Blank line encountered: stop
+    }
+    if (
+      lineTrimmed.startsWith("//") ||
+      lineTrimmed.startsWith("/*") ||
+      lineTrimmed.startsWith("*") ||
+      lineTrimmed.endsWith("*/")
+    ) {
+      commentLines.unshift(lines[currentRow]);
+      currentRow--;
+    } else {
+      break; // Non-comment text: stop
+    }
+  }
+
+  return commentLines.length > 0 ? commentLines.join("\n") : null;
+}
+
+/**
+ * Parse source code using Tree-sitter and extract functions, classes, and methods
+ */
+function extractSymbolsFromSource(content, ext) {
+  const parser = getParserForExtension(ext);
+  const tree = parser.parse(content);
+  const lines = content.split("\n");
+  const symbols = [];
+
+  function traverse(node) {
+    // 1. function_declaration
+    if (node.type === "function_declaration") {
+      const nameNode = node.childForFieldName("name");
+      if (nameNode && nameNode.text) {
+        const codeBody = content.slice(node.startIndex, node.endIndex);
+        symbols.push({
+          symbol_name: nameNode.text,
+          symbol_type: "function",
+          start_line: node.startPosition.row + 1,
+          end_line: node.endPosition.row + 1,
+          code_body: codeBody,
+          content_hash: computeHash(codeBody),
+          docstring: extractPrecedingComment(node, lines)
+        });
+      }
+    }
+    // 2. class_declaration
+    else if (node.type === "class_declaration") {
+      const nameNode = node.childForFieldName("name");
+      if (nameNode && nameNode.text) {
+        const codeBody = content.slice(node.startIndex, node.endIndex);
+        symbols.push({
+          symbol_name: nameNode.text,
+          symbol_type: "class",
+          start_line: node.startPosition.row + 1,
+          end_line: node.endPosition.row + 1,
+          code_body: codeBody,
+          content_hash: computeHash(codeBody),
+          docstring: extractPrecedingComment(node, lines)
+        });
+      }
+    }
+    // 3. method_definition (inside class body)
+    else if (node.type === "method_definition") {
+      const nameNode = node.childForFieldName("name");
+      if (nameNode && nameNode.text) {
+        const codeBody = content.slice(node.startIndex, node.endIndex);
+        symbols.push({
+          symbol_name: nameNode.text,
+          symbol_type: "method",
+          start_line: node.startPosition.row + 1,
+          end_line: node.endPosition.row + 1,
+          code_body: codeBody,
+          content_hash: computeHash(codeBody),
+          docstring: extractPrecedingComment(node, lines)
+        });
+      }
+    }
+    // 4. arrow_function or function_expression assigned to a variable_declarator
+    else if (node.type === "variable_declarator") {
+      const nameNode = node.childForFieldName("name");
+      const valueNode = node.childForFieldName("value");
+      if (
+        nameNode &&
+        nameNode.text &&
+        valueNode &&
+        (valueNode.type === "arrow_function" || valueNode.type === "function_expression")
+      ) {
+        const codeBody = content.slice(valueNode.startIndex, valueNode.endIndex);
+        symbols.push({
+          symbol_name: nameNode.text,
+          symbol_type: "function",
+          start_line: valueNode.startPosition.row + 1,
+          end_line: valueNode.endPosition.row + 1,
+          code_body: codeBody,
+          content_hash: computeHash(codeBody),
+          docstring: extractPrecedingComment(node, lines)
+        });
+      }
+    }
+
+    for (let i = 0; i < node.namedChildCount; i++) {
+      traverse(node.namedChild(i));
+    }
+  }
+
+  traverse(tree.rootNode);
+  return symbols;
+}
+
+/**
+ * Parse CLI arguments
  */
 function parseArgs() {
   const args = process.argv.slice(2);
@@ -184,14 +350,19 @@ async function main() {
     console.log(`      Pruned ${filesToDelete.length} stale/deleted file(s) from database.`);
   }
 
-  // 3. Process files & insert dummy symbols
-  console.log(`[3/3] Ingesting files and symbols...`);
+  // 3. Process files & extract symbols
+  console.log(`[3/3] Ingesting files and extracting symbols via Tree-sitter...`);
 
   let filesScanned = 0;
   let filesSkipped = 0;
   let filesProcessed = 0;
   let filesNoSymbols = 0;
   let symbolsInserted = 0;
+  const symbolsByType = {
+    function: 0,
+    class: 0,
+    method: 0
+  };
 
   for (const { fullPath, relPath } of files) {
     filesScanned++;
@@ -248,32 +419,53 @@ async function main() {
 
     filesProcessed++;
 
-    // Skip symbol creation if file extension does not produce function/class AST symbols
+    // Skip symbol creation if extension is non-symbol or not in JS/TS scope
     const ext = path.extname(relPath).toLowerCase();
-    if (NON_SYMBOL_EXTENSIONS.has(ext)) {
+    if (NON_SYMBOL_EXTENSIONS.has(ext) || !SUPPORTED_SYMBOL_EXTENSIONS.has(ext)) {
       filesNoSymbols++;
       continue;
     }
 
-    // Compute hash specifically for the symbol's code_body
-    const symbolCodeBody = content.slice(0, 100);
-    const symbolContentHash = computeHash(symbolCodeBody);
+    // Parse AST and extract symbols
+    let extracted = [];
+    try {
+      extracted = extractSymbolsFromSource(content, ext);
+    } catch (parseErr) {
+      console.warn(`      [WARN] Failed to parse AST for ${relPath}: ${parseErr.message}`);
+      continue;
+    }
 
-    // Insert dummy symbol proving the write path works
-    await prisma.symbol.create({
-      data: {
-        repo_id: repo.id,
-        file_id: fileRecord.id,
-        symbol_name: "TODO",
-        symbol_type: "function",
-        start_line: 1,
-        end_line: 1,
-        code_body: symbolCodeBody,
-        content_hash: symbolContentHash
+    if (extracted.length === 0) {
+      continue;
+    }
+
+    const symbolsData = extracted.map((sym) => ({
+      repo_id: repo.id,
+      file_id: fileRecord.id,
+      symbol_name: sym.symbol_name,
+      symbol_type: sym.symbol_type,
+      start_line: sym.start_line,
+      end_line: sym.end_line,
+      code_body: sym.code_body,
+      content_hash: sym.content_hash,
+      docstring: sym.docstring
+    }));
+
+    // Insert symbols using createMany with fallback to individual creates
+    try {
+      await prisma.symbol.createMany({
+        data: symbolsData
+      });
+    } catch (batchErr) {
+      for (const sym of symbolsData) {
+        await prisma.symbol.create({ data: sym });
       }
-    });
+    }
 
-    symbolsInserted++;
+    symbolsInserted += symbolsData.length;
+    for (const sym of symbolsData) {
+      symbolsByType[sym.symbol_type] = (symbolsByType[sym.symbol_type] || 0) + 1;
+    }
   }
 
   // Summary Report
@@ -285,6 +477,11 @@ async function main() {
   console.log(`Files Skipped (Cached)     : ${filesSkipped}`);
   console.log(`Files Skipped (No Symbols) : ${filesNoSymbols}`);
   console.log(`Symbols Inserted           : ${symbolsInserted}`);
+  if (symbolsInserted > 0) {
+    console.log(`  - Functions              : ${symbolsByType.function}`);
+    console.log(`  - Classes                : ${symbolsByType.class}`);
+    console.log(`  - Methods                : ${symbolsByType.method}`);
+  }
   console.log(`========================================\n`);
 }
 
