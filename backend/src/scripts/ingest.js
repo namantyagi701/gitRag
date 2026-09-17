@@ -52,6 +52,12 @@ const CODE_EXTENSIONS = new Set([
   ".json", ".yaml", ".yml", ".toml", ".md"
 ]);
 
+// Non-code/markup/config extensions that do not produce function/class AST symbols
+const NON_SYMBOL_EXTENSIONS = new Set([
+  ".json", ".yaml", ".yml", ".toml", ".md",
+  ".html", ".css", ".scss", ".sass", ".less"
+]);
+
 /**
  * Compute SHA-256 hash of file content
  */
@@ -184,6 +190,7 @@ async function main() {
   let filesScanned = 0;
   let filesSkipped = 0;
   let filesProcessed = 0;
+  let filesNoSymbols = 0;
   let symbolsInserted = 0;
 
   for (const { fullPath, relPath } of files) {
@@ -239,6 +246,19 @@ async function main() {
       where: { file_id: fileRecord.id }
     });
 
+    filesProcessed++;
+
+    // Skip symbol creation if file extension does not produce function/class AST symbols
+    const ext = path.extname(relPath).toLowerCase();
+    if (NON_SYMBOL_EXTENSIONS.has(ext)) {
+      filesNoSymbols++;
+      continue;
+    }
+
+    // Compute hash specifically for the symbol's code_body
+    const symbolCodeBody = content.slice(0, 100);
+    const symbolContentHash = computeHash(symbolCodeBody);
+
     // Insert dummy symbol proving the write path works
     await prisma.symbol.create({
       data: {
@@ -248,23 +268,23 @@ async function main() {
         symbol_type: "function",
         start_line: 1,
         end_line: 1,
-        code_body: content.slice(0, 100),
-        content_hash: contentHash
+        code_body: symbolCodeBody,
+        content_hash: symbolContentHash
       }
     });
 
     symbolsInserted++;
-    filesProcessed++;
   }
 
   // Summary Report
   console.log(`\n========================================`);
   console.log(` Ingestion Complete`);
   console.log(`========================================`);
-  console.log(`Files Scanned          : ${filesScanned}`);
-  console.log(`Files Processed (New)  : ${filesProcessed}`);
-  console.log(`Files Skipped (Cached) : ${filesSkipped}`);
-  console.log(`Symbols Inserted       : ${symbolsInserted}`);
+  console.log(`Files Scanned              : ${filesScanned}`);
+  console.log(`Files Processed (New)      : ${filesProcessed}`);
+  console.log(`Files Skipped (Cached)     : ${filesSkipped}`);
+  console.log(`Files Skipped (No Symbols) : ${filesNoSymbols}`);
+  console.log(`Symbols Inserted           : ${symbolsInserted}`);
   console.log(`========================================\n`);
 }
 

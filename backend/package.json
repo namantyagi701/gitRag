@@ -12,7 +12,7 @@
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "description": "",
+  "description": "GitRAG backend service",
   "dependencies": {
     "@neondatabase/serverless": "^1.1.0",
     "@prisma/client": "^6.19.3",
