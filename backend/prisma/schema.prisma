@@ -1,0 +1,155 @@
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [pgvector(map: "vector"), pg_trgm]
+}
+
+// ============================================================================
+// 1. Repositories
+// ============================================================================
+model Repo {
+  id               Int           @id @default(autoincrement())
+  owner            String
+  name             String
+  github_id        BigInt?       @unique
+  default_branch   String?       @default("main")
+  last_indexed_sha String?       // Commit SHA reflected in the live symbol set
+  created_at       DateTime?     @default(now()) @db.Timestamptz()
+
+  files            File[]
+  symbols          Symbol[]
+  pull_requests    PullRequest[]
+
+  @@unique([owner, name])
+  @@map("repos")
+}
+
+// ============================================================================
+// 2. Files (tracked to skip unchanged files fast)
+// ============================================================================
+model File {
+  id             Int           @id @default(autoincrement())
+  repo_id        Int
+  file_path      String
+  content_hash   String        // Hash of whole file; skips parsing if unchanged
+  last_parsed_at DateTime?     @default(now()) @db.Timestamptz()
+
+  repo           Repo          @relation(fields: [repo_id], references: [id], onDelete: Cascade)
+  symbols        Symbol[]
+
+  @@unique([repo_id, file_path])
+  @@map("files")
+}
+
+// ============================================================================
+// 3. Symbols (live current state — updated in-place, content-hashed)
+// ============================================================================
+model Symbol {
+  id            Int                          @id @default(autoincrement())
+  repo_id       Int
+  file_id       Int
+  symbol_name   String
+  symbol_type   String                       // 'function' | 'class' | 'method'
+  start_line    Int
+  end_line      Int
+  docstring     String?
+  code_body     String
+  content_hash  String                       // Hash of code_body; skips re-embedding if unchanged
+  embedding     Unsupported("vector(384)")?  // pgvector 384-dim embedding
+  search_vector Unsupported("tsvector")?    // Full-text search vector (see prisma/sql/extensions.sql)
+  updated_at    DateTime?                    @default(now()) @db.Timestamptz()
+
+  repo          Repo                         @relation(fields: [repo_id], references: [id], onDelete: Cascade)
+  file          File                         @relation(fields: [file_id], references: [id], onDelete: Cascade)
+
+  caller_edges       SymbolEdge[]       @relation("CallerEdges")
+  callee_edges       SymbolEdge[]       @relation("CalleeEdges")
+  pr_changed_symbols PrChangedSymbol[]
+  source_impacts     PrImpact[]         @relation("SourceImpacts")
+  impacted_impacts   PrImpact[]         @relation("ImpactedImpacts")
+
+  @@index([file_id], map: "idx_symbols_file")
+  @@index([repo_id], map: "idx_symbols_repo")
+  @@map("symbols")
+}
+
+// ============================================================================
+// 4. Dependency Graph Edges (direct calls; room for imports/extends)
+// ============================================================================
+model SymbolEdge {
+  id               Int       @id @default(autoincrement())
+  caller_symbol_id Int
+  callee_symbol_id Int
+  edge_type        String    @default("calls")
+  created_at       DateTime? @default(now()) @db.Timestamptz()
+
+  caller_symbol    Symbol    @relation("CallerEdges", fields: [caller_symbol_id], references: [id], onDelete: Cascade)
+  callee_symbol    Symbol    @relation("CalleeEdges", fields: [callee_symbol_id], references: [id], onDelete: Cascade)
+
+  @@unique([caller_symbol_id, callee_symbol_id, edge_type])
+  @@index([caller_symbol_id], map: "idx_edges_caller")
+  @@index([callee_symbol_id], map: "idx_edges_callee")
+  @@map("symbol_edges")
+}
+
+// ============================================================================
+// 5. Pull Requests
+// ============================================================================
+model PullRequest {
+  id         Int       @id @default(autoincrement())
+  repo_id    Int
+  pr_number  Int
+  base_sha   String
+  head_sha   String
+  status     String    @default("pending") // pending | processing | completed | failed
+  created_at DateTime? @default(now()) @db.Timestamptz()
+
+  repo               Repo              @relation(fields: [repo_id], references: [id], onDelete: Cascade)
+  pr_changed_symbols PrChangedSymbol[]
+  pr_impacts         PrImpact[]
+
+  @@unique([repo_id, pr_number, head_sha])
+  @@map("pull_requests")
+}
+
+// ============================================================================
+// 6. Symbols Directly Touched by PR Diff (Ground Truth)
+// ============================================================================
+model PrChangedSymbol {
+  id          Int         @id @default(autoincrement())
+  pr_id       Int
+  symbol_id   Int
+  change_type String      // 'added' | 'modified' | 'removed'
+
+  pull_request PullRequest @relation(fields: [pr_id], references: [id], onDelete: Cascade)
+  symbol       Symbol      @relation(fields: [symbol_id], references: [id], onDelete: Cascade)
+
+  @@map("pr_changed_symbols")
+}
+
+// ============================================================================
+// 7. Final Impact Report Rows (Inference / Graph + Hybrid Search)
+// ============================================================================
+model PrImpact {
+  id                 Int         @id @default(autoincrement())
+  pr_id              Int
+  source_symbol_id   Int         // The symbol that changed
+  impacted_symbol_id Int         // The symbol flagged as affected
+  relation_type      String      // 'direct_call' | 'transitive_call' | 'semantic' | 'keyword'
+  hop_distance       Int?        // NULL for non-graph relations
+  rerank_score       Float?      @db.Real // Cross-encoder output, NULL if graph-only
+  severity           String      // 'high' | 'medium' | 'low'
+  reason             String
+  created_at         DateTime?   @default(now()) @db.Timestamptz()
+
+  pull_request    PullRequest @relation(fields: [pr_id], references: [id], onDelete: Cascade)
+  source_symbol   Symbol      @relation("SourceImpacts", fields: [source_symbol_id], references: [id])
+  impacted_symbol Symbol      @relation("ImpactedImpacts", fields: [impacted_symbol_id], references: [id])
+
+  @@map("pr_impacts")
+}
