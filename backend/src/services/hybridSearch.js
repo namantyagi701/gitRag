@@ -13,6 +13,7 @@
  * @param {number} [params.textWeight=0.4] - Weight for keyword/full-text score
  * @param {number} [params.vectorWeight=0.6] - Weight for vector similarity score
  * @param {number} [params.limit=25] - Maximum number of results to return
+ * @param {number} [params.minScore=0.3] - Minimum combined score threshold
  * @returns {Promise<Array<Object>>} Ranked search results
  */
 async function hybridSearch({
@@ -22,7 +23,8 @@ async function hybridSearch({
   prisma,
   textWeight = 0.4,
   vectorWeight = 0.6,
-  limit = 25
+  limit = 25,
+  minScore = 0.3
 }) {
   if (!query || typeof query !== "string" || !query.trim()) {
     return [];
@@ -33,25 +35,25 @@ async function hybridSearch({
   const queryEmbedding = Array.from(output.data);
   const vectorLiteral = `[${queryEmbedding.join(",")}]`;
 
-  // 2. Execute hybrid search raw query
-  // Text score uses ts_rank over generated search_vector, coalescing null/empty to 0.
-  // Vector score uses 1 - cosine distance (pgvector <=> operator).
+  // 2. Execute hybrid search raw query with CTE and threshold filter
   const rows = await prisma.$queryRaw`
-    SELECT 
-      s.id AS symbol_id,
-      s.symbol_name,
-      s.symbol_type,
-      f.file_path,
-      s.code_body,
-      COALESCE(ts_rank(s.search_vector, plainto_tsquery('english', ${query})), 0)::float AS text_score,
-      (1 - (s.embedding <=> ${vectorLiteral}::vector))::float AS vector_score,
-      (
-        (COALESCE(ts_rank(s.search_vector, plainto_tsquery('english', ${query})), 0) * ${textWeight}) +
-        ((1 - (s.embedding <=> ${vectorLiteral}::vector)) * ${vectorWeight})
-      )::float AS combined_score
-    FROM symbols s
-    JOIN files f ON s.file_id = f.id
-    WHERE s.repo_id = ${repoId} AND s.embedding IS NOT NULL
+    WITH scored AS (
+      SELECT 
+        s.id AS symbol_id,
+        s.symbol_name,
+        s.symbol_type,
+        f.file_path,
+        s.code_body,
+        COALESCE(ts_rank(s.search_vector, plainto_tsquery('english', ${query})), 0)::float AS text_score,
+        (1 - (s.embedding <=> ${vectorLiteral}::vector))::float AS vector_score
+      FROM symbols s
+      JOIN files f ON s.file_id = f.id
+      WHERE s.repo_id = ${repoId} AND s.embedding IS NOT NULL
+    )
+    SELECT *,
+      (text_score * ${textWeight} + vector_score * ${vectorWeight})::float AS combined_score
+    FROM scored
+    WHERE (text_score * ${textWeight} + vector_score * ${vectorWeight}) >= ${minScore}
     ORDER BY combined_score DESC
     LIMIT ${limit}
   `;

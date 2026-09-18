@@ -9,37 +9,50 @@ const { hybridSearch } = require("../services/hybridSearch");
 const prisma = new PrismaClient();
 
 function parseArgs() {
-  const args = process.argv.slice(2);
+  const rawArgs = process.argv.slice(2);
+  let minScore = 0.3;
+  const filteredArgs = [];
 
-  if (args.length < 2) {
-    console.error("Usage: node src/scripts/testSearch.js <query> <owner> <name>");
-    console.error("   or: node src/scripts/testSearch.js <query> <owner/name>");
-    console.error("   or: node src/scripts/testSearch.js <query> <repo_id>");
+  for (const arg of rawArgs) {
+    if (arg.startsWith("--minScore=")) {
+      const val = parseFloat(arg.split("=")[1]);
+      if (!isNaN(val)) {
+        minScore = val;
+      }
+    } else {
+      filteredArgs.push(arg);
+    }
+  }
+
+  if (filteredArgs.length < 2) {
+    console.error("Usage: node src/scripts/testSearch.js <query> <owner> <name> [--minScore=X]");
+    console.error("   or: node src/scripts/testSearch.js <query> <owner/name> [--minScore=X]");
+    console.error("   or: node src/scripts/testSearch.js <query> <repo_id> [--minScore=X]");
     process.exit(1);
   }
 
-  const query = args[0];
+  const query = filteredArgs[0];
   let owner;
   let name;
   let repoId;
 
-  if (args.length >= 3) {
-    owner = args[1];
-    name = args[2];
-  } else if (!isNaN(parseInt(args[1], 10)) && !args[1].includes("/")) {
-    repoId = parseInt(args[1], 10);
-  } else if (args[1].includes("/")) {
-    [owner, name] = args[1].split("/", 2);
+  if (filteredArgs.length >= 3) {
+    owner = filteredArgs[1];
+    name = filteredArgs[2];
+  } else if (!isNaN(parseInt(filteredArgs[1], 10)) && !filteredArgs[1].includes("/")) {
+    repoId = parseInt(filteredArgs[1], 10);
+  } else if (filteredArgs[1].includes("/")) {
+    [owner, name] = filteredArgs[1].split("/", 2);
   } else {
     console.error("Error: Please provide both owner and name (e.g. 'namantyagi701 gitRag' or 'namantyagi701/gitRag')");
     process.exit(1);
   }
 
-  return { query, owner, name, repoId };
+  return { query, owner, name, repoId, minScore };
 }
 
 async function main() {
-  const { query, owner, name, repoId: rawRepoId } = parseArgs();
+  const { query, owner, name, repoId: rawRepoId, minScore } = parseArgs();
 
   // 1. Resolve repository
   let repoId = rawRepoId;
@@ -70,7 +83,8 @@ async function main() {
   console.log(` GitRAG Hybrid Search`);
   console.log(`========================================`);
   console.log(`Query      : "${query}"`);
-  console.log(`Repository : ${repoName} (ID: ${repoId})\n`);
+  console.log(`Repository : ${repoName} (ID: ${repoId})`);
+  console.log(`Min Score  : ${minScore}\n`);
 
   // 2. Load embedder once
   console.log(`Loading embedding model (Xenova/all-MiniLM-L6-v2)...`);
@@ -85,11 +99,12 @@ async function main() {
     prisma,
     textWeight: 0.4,
     vectorWeight: 0.6,
-    limit: 25
+    limit: 25,
+    minScore
   });
 
   if (results.length === 0) {
-    console.log(`No matching symbols found.\n`);
+    console.log(`No results above the relevance threshold (${minScore}) — try a different query or lower --minScore\n`);
     return;
   }
 
