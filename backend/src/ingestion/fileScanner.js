@@ -7,7 +7,9 @@ const { IGNORED_DIRS, CODE_EXTENSIONS } = require("./constants");
  * Compute SHA-256 hash of a string
  */
 function computeHash(content) {
-  return crypto.createHash("sha256").update(content).digest("hex");
+  // Normalize string input before hashing
+  const normalized = typeof content === "string" ? content : String(content);
+  return crypto.createHash("sha256").update(normalized).digest("hex");
 }
 
 /**
