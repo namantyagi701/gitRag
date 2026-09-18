@@ -121,13 +121,15 @@ model PullRequest {
 // 6. Symbols Directly Touched by PR Diff (Ground Truth)
 // ============================================================================
 model PrChangedSymbol {
-  id          Int         @id @default(autoincrement())
+  id          Int          @id @default(autoincrement())
   pr_id       Int
-  symbol_id   Int
-  change_type String      // 'added' | 'modified' | 'removed'
+  symbol_id   Int?
+  symbol_name String?
+  file_path   String?
+  change_type String       // 'added' | 'modified' | 'removed'
 
   pull_request PullRequest @relation(fields: [pr_id], references: [id], onDelete: Cascade)
-  symbol       Symbol      @relation(fields: [symbol_id], references: [id], onDelete: Cascade)
+  symbol       Symbol?     @relation(fields: [symbol_id], references: [id], onDelete: SetNull)
 
   @@map("pr_changed_symbols")
 }
