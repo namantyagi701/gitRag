@@ -24,6 +24,8 @@ const { runPass2EdgeExtraction } = require("../ingestion/passes/pass2Edges");
 const { runPass3EmbeddingGeneration } = require("../ingestion/passes/pass3Embeddings");
 const { processPrDiff } = require("../services/prDiffProcessor");
 const { analyzeImpact } = require("../services/impactAnalyzer");
+const { formatImpactReportMarkdown } = require("../services/reportFormatter");
+const { postImpactComment } = require("../services/githubCommenter");
 
 const prisma = new PrismaClient();
 let embedder = null;
@@ -115,19 +117,43 @@ async function processJob(job) {
       prisma
     });
 
-    // 6. Log completion summary
+    // 6. Format and post GitHub PR comment
+    console.log(`[Worker] Generating PR comment report for PR #${prNumber}...`);
+    const markdownBody = formatImpactReportMarkdown({
+      changedSymbols: diffResult.changedSymbols,
+      impactRows: impactResult.impactRows
+    });
+
+    const commentResult = await postImpactComment({
+      owner,
+      name,
+      prNumber,
+      markdownBody
+    });
+
+    if (commentResult.success) {
+      console.log(`[Worker] Comment successfully posted to PR #${prNumber}: ${commentResult.url}`);
+    } else {
+      console.warn(`[Worker WARN] Could not post comment to PR #${prNumber}: ${commentResult.error}`);
+    }
+
+    // 7. Log completion summary
     console.log(`\n--------------------------------------------------------------------------------`);
     console.log(`[Worker] SUCCESS: PR #${prNumber} Impact Analysis Completed`);
     console.log(`  Total Impact Rows: ${impactResult.totalImpactRows}`);
     console.log(`  Direct Calls:      ${impactResult.byRelationType.direct_call}`);
     console.log(`  Transitive Calls:  ${impactResult.byRelationType.transitive_call}`);
     console.log(`  Semantic Matches:  ${impactResult.byRelationType.semantic}`);
+    if (commentResult.url) {
+      console.log(`  Comment URL:       ${commentResult.url}`);
+    }
     console.log(`--------------------------------------------------------------------------------\n`);
 
     return {
       prId: diffResult.prId,
       totalImpactRows: impactResult.totalImpactRows,
-      byRelationType: impactResult.byRelationType
+      byRelationType: impactResult.byRelationType,
+      commentUrl: commentResult.url || null
     };
   } catch (err) {
     console.error(`\n[Worker ERROR] Job ${job.id} for PR #${prNumber} failed:`, err.message);

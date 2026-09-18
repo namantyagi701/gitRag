@@ -1,56 +1,15 @@
-/**
- * Script to simulate GitHub Webhook calls with HMAC-SHA256 signatures.
- *
- * Usage:
- *   node scripts/simulateWebhook.js --valid
- *   node scripts/simulateWebhook.js --invalid-sig
- *   node scripts/simulateWebhook.js --unregistered
- *   node scripts/simulateWebhook.js --all
- */
-
 const path = require("path");
 const crypto = require("crypto");
 require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
 
 const PORT = process.env.PORT || 3000;
 const WEBHOOK_URL = `http://localhost:${PORT}/webhook/github`;
-const SECRET = process.env.GITHUB_WEBHOOK_SECRET || "test_webhook_secret_gitrag";
+const SECRET = process.env.GITHUB_WEBHOOK_SECRET;
 
 function computeSignature(payloadString, secret) {
   const hmac = crypto.createHmac("sha256", secret);
   hmac.update(payloadString);
   return `sha256=${hmac.digest("hex")}`;
-}
-
-async function sendWebhook({ payload, signature, description }) {
-  console.log(`\n==================================================`);
-  console.log(`[SIMULATE] ${description}`);
-  console.log(`Endpoint: ${WEBHOOK_URL}`);
-  console.log(`Signature: ${signature}`);
-
-  const payloadString = JSON.stringify(payload);
-
-  try {
-    const startTime = Date.now();
-    const response = await fetch(WEBHOOK_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Hub-Signature-256": signature,
-      },
-      body: payloadString,
-    });
-    const duration = Date.now() - startTime;
-
-    const data = await response.json().catch(() => ({}));
-    console.log(`Response Status: ${response.status} ${response.statusText} (${duration}ms)`);
-    console.log(`Response Body:`, JSON.stringify(data, null, 2));
-
-    return { status: response.status, data, duration };
-  } catch (err) {
-    console.error(`[SIMULATE ERROR] Request failed:`, err.message);
-    return { error: err.message };
-  }
 }
 
 function buildPayload({ owner, name, prNumber, baseSha, headSha }) {
@@ -84,82 +43,79 @@ function buildPayload({ owner, name, prNumber, baseSha, headSha }) {
   };
 }
 
-async function testValid() {
-  const payload = buildPayload({
-    owner: "namantyagi701",
-    name: "gitRag",
-    prNumber: 99,
-    baseSha: "e3b008b",
-    headSha: "2c50b78",
+async function sendRequest(payload, signature) {
+  const payloadString = JSON.stringify(payload);
+  const response = await fetch(WEBHOOK_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Hub-Signature-256": signature,
+    },
+    body: payloadString,
   });
-  const payloadStr = JSON.stringify(payload);
-  const signature = computeSignature(payloadStr, SECRET);
 
-  return await sendWebhook({
-    payload,
-    signature,
-    description: "Scenario 1: Valid PR webhook for registered repo (namantyagi701/gitRag #99)",
-  });
-}
+  const text = await response.text();
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    parsed = text;
+  }
 
-async function testInvalidSignature() {
-  const payload = buildPayload({
-    owner: "namantyagi701",
-    name: "gitRag",
-    prNumber: 100,
-    baseSha: "e3b008b",
-    headSha: "2c50b78",
-  });
-  const badSignature = "sha256=0000000000000000000000000000000000000000000000000000000000000000";
-
-  return await sendWebhook({
-    payload,
-    signature: badSignature,
-    description: "Scenario 2: Invalid signature rejection test",
-  });
-}
-
-async function testUnregisteredRepo() {
-  const payload = buildPayload({
-    owner: "facebook",
-    name: "react",
-    prNumber: 101,
-    baseSha: "e3b008b",
-    headSha: "2c50b78",
-  });
-  const payloadStr = JSON.stringify(payload);
-  const signature = computeSignature(payloadStr, SECRET);
-
-  return await sendWebhook({
-    payload,
-    signature,
-    description: "Scenario 3: Unregistered repo skip test (facebook/react)",
-  });
+  console.log(`HTTP ${response.status} ${response.statusText}`);
+  console.log(JSON.stringify(parsed, null, 2));
 }
 
 async function main() {
-  const arg = process.argv[2] || "--all";
+  const mode = process.argv[2] || "1";
 
-  if (arg === "--valid") {
-    await testValid();
-  } else if (arg === "--invalid-sig") {
-    await testInvalidSignature();
-  } else if (arg === "--unregistered") {
-    await testUnregisteredRepo();
-  } else {
-    console.log("Running all webhook simulation tests...");
-    await testInvalidSignature();
-    await testUnregisteredRepo();
-    await testValid();
+  if (mode === "1" || mode === "real") {
+    // Scenario 1: Real GitHub PR
+    const payload = buildPayload({
+      owner: "namantyagi701",
+      name: "gitRag",
+      prNumber: 1,
+      baseSha: "7d4b4cd5e79c685f7b4a66a06109c6c24f48f615",
+      headSha: "e6250093b22b8d6517ecd6e184d61cff65c8c7e5",
+    });
+    const payloadString = JSON.stringify(payload);
+    const signature = computeSignature(payloadString, SECRET);
+    await sendRequest(payload, signature);
+  } else if (mode === "2") {
+    // Scenario 2: Signature rejection
+    const payload = buildPayload({
+      owner: "namantyagi701",
+      name: "gitRag",
+      prNumber: 106,
+      baseSha: "e3b008b",
+      headSha: "2c50b78",
+    });
+    const badSignature = "sha256=" + "0".repeat(64);
+    await sendRequest(payload, badSignature);
+  } else if (mode === "3") {
+    // Scenario 3: Unregistered repo
+    const payload = buildPayload({
+      owner: "facebook",
+      name: "react",
+      prNumber: 107,
+      baseSha: "e3b008b",
+      headSha: "2c50b78",
+    });
+    const payloadString = JSON.stringify(payload);
+    const signature = computeSignature(payloadString, SECRET);
+  } else if (mode === "fail") {
+    // Failure path test: PR 108 with valid signature but invalid GITHUB_TOKEN
+    const payload = buildPayload({
+      owner: "namantyagi701",
+      name: "gitRag",
+      prNumber: 108,
+      baseSha: "e3b008b",
+      headSha: "2c50b78",
+    });
+    const payloadString = JSON.stringify(payload);
+    const signature = computeSignature(payloadString, SECRET);
+    await sendRequest(payload, signature);
   }
 }
 
-if (require.main === module) {
-  main();
-}
-
-module.exports = {
-  testValid,
-  testInvalidSignature,
-  testUnregisteredRepo,
-};
+main().catch(console.error);
