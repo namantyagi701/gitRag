@@ -108,14 +108,16 @@ async function analyzeImpact({
         limit: semanticLimit + 10
       });
 
-      console.log(`\n[DEBUG raw candidatePool results for ${symbol.symbol_name}] count: ${candidatePool.length}`);
-      console.log(JSON.stringify(candidatePool.map((r, idx) => ({
-        rank: idx + 1,
-        symbol_id: r.symbol_id,
-        symbol_name: r.symbol_name,
-        combined_score: r.combined_score
-      })), null, 2));
-      console.log("");
+      if (process.env.DEBUG_IMPACT_ANALYSIS) {
+        console.log(`\n[DEBUG raw candidatePool results for ${symbol.symbol_name}] count: ${candidatePool.length}`);
+        console.log(JSON.stringify(candidatePool.map((r, idx) => ({
+          rank: idx + 1,
+          symbol_id: r.symbol_id,
+          symbol_name: r.symbol_name,
+          combined_score: r.combined_score
+        })), null, 2));
+        console.log("");
+      }
 
       const filteredResults = [];
       for (const res of candidatePool) {
