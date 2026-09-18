@@ -9,6 +9,7 @@ const { IGNORED_DIRS, CODE_EXTENSIONS } = require("./constants");
 function computeHash(content) {
   // Normalize string input before hashing
   const normalized = typeof content === "string" ? content : String(content);
+  // Generate sha256 checksum digest
   return crypto.createHash("sha256").update(normalized).digest("hex");
 }
 
