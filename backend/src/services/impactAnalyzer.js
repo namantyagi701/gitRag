@@ -18,9 +18,19 @@ const { prepareEmbeddingText } = require("../ingestion/embedder");
  * @param {number} params.repoId - Repository ID
  * @param {Function} params.embedder - Xenova embedding pipeline
  * @param {Object} params.prisma - PrismaClient instance
+ * @param {number} [params.semanticLimit=5] - Maximum semantic search results per changed symbol
+ * @param {number} [params.semanticMinScore=0.5] - Minimum combined score threshold for semantic matches
  * @returns {Promise<{ totalImpactRows: number, byRelationType: Object, impactRows: Array<Object> }>}
  */
-async function analyzeImpact({ prId, changedSymbols, repoId, embedder, prisma }) {
+async function analyzeImpact({
+  prId,
+  changedSymbols,
+  repoId,
+  embedder,
+  prisma,
+  semanticLimit = 5,
+  semanticMinScore = 0.5
+}) {
   if (!prId || !Array.isArray(changedSymbols) || !repoId || !embedder || !prisma) {
     throw new Error("Missing required parameters for analyzeImpact");
   }
@@ -44,6 +54,9 @@ async function analyzeImpact({ prId, changedSymbols, repoId, embedder, prisma })
       });
 
       for (const dep of dependents) {
+        if (dep.symbol_id === symbol.symbol_id) {
+          continue;
+        }
         capturedImpactedIds.add(dep.symbol_id);
         const isDirect = dep.hop_distance === 1;
 
@@ -74,16 +87,38 @@ async function analyzeImpact({ prId, changedSymbols, repoId, embedder, prisma })
     );
 
     if (query && query.trim()) {
-      const searchResults = await hybridSearch({
+      // semanticMinScore is intentionally higher than hybridSearch()'s own 
+      // default (0.3) — that default was calibrated against nonsense-query 
+      // noise, but same-codebase functions cluster together semantically 
+      // even when functionally unrelated, so impact reports need a stricter 
+      // bar to avoid drowning real signal in plausible-looking noise.
+      //
+      // Headroom buffer (+10): hybridSearch() is called with a buffer to absorb
+      // self-match (the changed symbol itself) and graph-dedup exclusions before
+      // truncating in JS. Note that this +10 buffer is a heuristic headroom, not an
+      // absolute guarantee (e.g. symbols with >10 graph callers could exhaust it);
+      // a fully correct fix would require hybridSearch() to accept an excludeIds
+      // parameter and filter at the SQL level before LIMIT is applied.
+      const candidatePool = await hybridSearch({
         query,
         repoId,
         embedder,
         prisma,
-        minScore: 0.3,
-        limit: 10
+        minScore: semanticMinScore,
+        limit: semanticLimit + 10
       });
 
-      for (const res of searchResults) {
+      console.log(`\n[DEBUG raw candidatePool results for ${symbol.symbol_name}] count: ${candidatePool.length}`);
+      console.log(JSON.stringify(candidatePool.map((r, idx) => ({
+        rank: idx + 1,
+        symbol_id: r.symbol_id,
+        symbol_name: r.symbol_name,
+        combined_score: r.combined_score
+      })), null, 2));
+      console.log("");
+
+      const filteredResults = [];
+      for (const res of candidatePool) {
         // Exclude the changed symbol itself
         if (symbol.symbol_id != null && res.symbol_id === symbol.symbol_id) {
           continue;
@@ -101,6 +136,13 @@ async function analyzeImpact({ prId, changedSymbols, repoId, embedder, prisma })
           continue;
         }
 
+        filteredResults.push(res);
+      }
+
+      // Truncate filtered results down to semanticLimit
+      const finalSemanticResults = filteredResults.slice(0, semanticLimit);
+
+      for (const res of finalSemanticResults) {
         capturedImpactedIds.add(res.symbol_id);
 
         impactRows.push({
