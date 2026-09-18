@@ -76,6 +76,9 @@ function extractPrecedingComment(node, lines) {
  * Parse source code using Tree-sitter and extract functions, classes, and methods
  */
 function extractSymbolsFromSource(content, ext) {
+  if (!content || typeof content !== "string") {
+    return [];
+  }
   const parser = getParserForExtension(ext);
   const tree = parser.parse(content);
   const lines = content.split("\n");
