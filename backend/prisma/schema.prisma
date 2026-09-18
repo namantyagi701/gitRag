@@ -140,7 +140,7 @@ model PrChangedSymbol {
 model PrImpact {
   id                 Int         @id @default(autoincrement())
   pr_id              Int
-  source_symbol_id   Int         // The symbol that changed
+  source_symbol_id   Int?        // The symbol that changed (null if added symbol)
   impacted_symbol_id Int         // The symbol flagged as affected
   relation_type      String      // 'direct_call' | 'transitive_call' | 'semantic' | 'keyword'
   hop_distance       Int?        // NULL for non-graph relations
@@ -150,8 +150,8 @@ model PrImpact {
   created_at         DateTime?   @default(now()) @db.Timestamptz()
 
   pull_request    PullRequest @relation(fields: [pr_id], references: [id], onDelete: Cascade)
-  source_symbol   Symbol      @relation("SourceImpacts", fields: [source_symbol_id], references: [id])
-  impacted_symbol Symbol      @relation("ImpactedImpacts", fields: [impacted_symbol_id], references: [id])
+  source_symbol   Symbol?     @relation("SourceImpacts", fields: [source_symbol_id], references: [id], onDelete: SetNull)
+  impacted_symbol Symbol      @relation("ImpactedImpacts", fields: [impacted_symbol_id], references: [id], onDelete: Cascade)
 
   @@map("pr_impacts")
 }

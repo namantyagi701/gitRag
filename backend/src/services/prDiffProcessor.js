@@ -97,6 +97,8 @@ async function processPrDiff({ repoPath, repo, prNumber, baseSha, headSha, prism
           symbol_id: null,
           symbol_name: sym.symbol_name,
           symbol_type: sym.symbol_type,
+          code_body: sym.code_body,
+          docstring: sym.docstring,
           file_path: dbFilePath,
           change_type: "removed"
         });
@@ -133,6 +135,8 @@ async function processPrDiff({ repoPath, repo, prNumber, baseSha, headSha, prism
           symbol_id: null,
           symbol_name: sym.symbol_name,
           symbol_type: sym.symbol_type,
+          code_body: sym.code_body,
+          docstring: sym.docstring,
           file_path: dbFilePath,
           change_type: "removed"
         });
@@ -180,6 +184,8 @@ async function processPrDiff({ repoPath, repo, prNumber, baseSha, headSha, prism
           symbol_id: null,
           symbol_name: headSym.symbol_name,
           symbol_type: headSym.symbol_type,
+          code_body: headSym.code_body,
+          docstring: headSym.docstring,
           file_path: dbFilePath,
           change_type: "added"
         });
@@ -190,6 +196,8 @@ async function processPrDiff({ repoPath, repo, prNumber, baseSha, headSha, prism
             symbol_id: null,
             symbol_name: headSym.symbol_name,
             symbol_type: headSym.symbol_type,
+            code_body: headSym.code_body,
+            docstring: headSym.docstring,
             file_path: dbFilePath,
             change_type: "modified"
           });
@@ -204,6 +212,8 @@ async function processPrDiff({ repoPath, repo, prNumber, baseSha, headSha, prism
           symbol_id: null,
           symbol_name: baseSym.symbol_name,
           symbol_type: baseSym.symbol_type,
+          code_body: baseSym.code_body,
+          docstring: baseSym.docstring,
           file_path: dbFilePath,
           change_type: "removed"
         });
