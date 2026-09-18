@@ -9,7 +9,17 @@ const PORT = process.env.PORT || 3000;
 
 // Middleware
 app.use(cors());
-app.use(express.json());
+app.use(
+  express.json({
+    verify: (req, res, buf) => {
+      req.rawBody = buf;
+    },
+  })
+);
+
+// Routes
+const webhookRouter = require("./src/routes/webhook");
+app.use("/webhook", webhookRouter);
 
 // Neon SQL client
 const sql = process.env.DATABASE_URL

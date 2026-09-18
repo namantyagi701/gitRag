@@ -26,3 +26,5 @@ Thumbs.db
 # Temporary files & tests
 coverage/
 .scratch/
+repo-clones/
+*.rdb
