@@ -21,6 +21,9 @@ app.use(
 const webhookRouter = require("./src/routes/webhook");
 app.use("/webhook", webhookRouter);
 
+const apiRouter = require("./src/routes/api");
+app.use("/api/v1", apiRouter);
+
 // Neon SQL client
 const sql = process.env.DATABASE_URL
   ? neon(process.env.DATABASE_URL)

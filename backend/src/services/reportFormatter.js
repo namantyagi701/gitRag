@@ -21,6 +21,78 @@ function formatConfidence(relationType, severity) {
   }
 }
 
+const severityOrder = { high: 1, medium: 2, low: 3 };
+
+/**
+ * Compare two impact rows by severity (high -> medium -> low),
+ * then alphabetically by impacted symbol name.
+ */
+function compareImpactSeverity(a, b) {
+  const orderA = severityOrder[a.severity] || 99;
+  const orderB = severityOrder[b.severity] || 99;
+  if (orderA !== orderB) return orderA - orderB;
+
+  const nameA =
+    a.impacted_symbol_name ||
+    a.impacted_symbol?.symbol_name ||
+    "";
+  const nameB =
+    b.impacted_symbol_name ||
+    b.impacted_symbol?.symbol_name ||
+    "";
+  return nameA.localeCompare(nameB);
+}
+
+/**
+ * Check if an impact row belongs to a changed symbol
+ */
+function impactMatchesSymbol(impact, symbol) {
+  if (symbol.symbol_id != null && impact.source_symbol_id != null) {
+    return impact.source_symbol_id === symbol.symbol_id;
+  }
+  const sourceName = impact.source_symbol?.symbol_name || impact.source_symbol_name;
+  const sourcePath =
+    impact.source_symbol?.file_path ||
+    impact.source_file_path ||
+    impact.source_symbol?.file?.file_path;
+  return (
+    Boolean(sourceName) &&
+    sourceName === symbol.symbol_name &&
+    Boolean(sourcePath) &&
+    sourcePath === symbol.file_path
+  );
+}
+
+/**
+ * Group and sort impacts by source symbol, and severity within each group
+ */
+function groupAndSortImpacts(changedSymbols = [], impactRows = []) {
+  const result = [];
+  const handledImpacts = new Set();
+
+  for (const symbol of changedSymbols) {
+    const matches = [];
+    for (const imp of impactRows) {
+      if (impactMatchesSymbol(imp, symbol)) {
+        matches.push(imp);
+        handledImpacts.add(imp);
+      }
+    }
+
+    matches.sort(compareImpactSeverity);
+    result.push(...matches);
+  }
+
+  // Any impacts that did not match a changed symbol (edge case)
+  const remaining = impactRows.filter((imp) => !handledImpacts.has(imp));
+  if (remaining.length > 0) {
+    remaining.sort(compareImpactSeverity);
+    result.push(...remaining);
+  }
+
+  return result;
+}
+
 /**
  * Format changed symbols and impact rows into GitHub PR comment markdown
  *
@@ -49,22 +121,11 @@ function formatImpactReportMarkdown({ changedSymbols = [], impactRows = [] }) {
   );
 
   // 3. Group impacts by source changed symbol
-  const severityOrder = { high: 1, medium: 2, low: 3 };
-
   for (const symbol of changedSymbols) {
     lines.push(`### \`${symbol.symbol_name}\` (${symbol.change_type}) — \`${symbol.file_path}\`\n`);
 
     // Match impacts for this changed symbol
-    const matches = impactRows.filter((imp) => {
-      if (symbol.symbol_id != null && imp.source_symbol_id != null) {
-        return imp.source_symbol_id === symbol.symbol_id;
-      }
-      return (
-        imp.source_symbol &&
-        imp.source_symbol.symbol_name === symbol.symbol_name &&
-        imp.source_symbol.file_path === symbol.file_path
-      );
-    });
+    const matches = impactRows.filter((imp) => impactMatchesSymbol(imp, symbol));
 
     if (matches.length === 0) {
       lines.push("No downstream impacts detected for this symbol.\n");
@@ -72,12 +133,7 @@ function formatImpactReportMarkdown({ changedSymbols = [], impactRows = [] }) {
     }
 
     // Sort rows within symbol's table by severity (high -> medium -> low)
-    matches.sort((a, b) => {
-      const orderA = severityOrder[a.severity] || 99;
-      const orderB = severityOrder[b.severity] || 99;
-      if (orderA !== orderB) return orderA - orderB;
-      return (a.impacted_symbol_name || "").localeCompare(b.impacted_symbol_name || "");
-    });
+    matches.sort(compareImpactSeverity);
 
     // Render markdown table
     lines.push("| Confidence | Symbol | File | Reason |");
@@ -85,8 +141,8 @@ function formatImpactReportMarkdown({ changedSymbols = [], impactRows = [] }) {
 
     for (const row of matches) {
       const confidence = formatConfidence(row.relation_type, row.severity);
-      const sym = `\`${row.impacted_symbol_name}\``;
-      const file = `\`${row.impacted_file_path}\``;
+      const sym = `\`${row.impacted_symbol_name || row.impacted_symbol?.symbol_name}\``;
+      const file = `\`${row.impacted_file_path || row.impacted_symbol?.file?.file_path || row.impacted_symbol?.file_path}\``;
       const reason = row.reason.replace(/\|/g, "\\|");
       lines.push(`| ${confidence} | ${sym} | ${file} | ${reason} |`);
     }
@@ -103,5 +159,9 @@ function formatImpactReportMarkdown({ changedSymbols = [], impactRows = [] }) {
 }
 
 module.exports = {
-  formatImpactReportMarkdown
+  formatImpactReportMarkdown,
+  compareImpactSeverity,
+  impactMatchesSymbol,
+  groupAndSortImpacts
 };
+

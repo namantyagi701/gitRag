@@ -12,14 +12,28 @@ const IORedis = require("ioredis");
 const redisUrl = process.env.REDIS_URL || "redis://127.0.0.1:6379";
 
 const connection = new IORedis(redisUrl, {
-  maxRetriesPerRequest: null
+  maxRetriesPerRequest: null,
+  enableOfflineQueue: false
+});
+
+connection.on("error", (err) => {
+  if (err.code === "ECONNREFUSED") {
+    // Suppress constant console flooding when Redis is not running
+    return;
+  }
+  console.warn("[Redis WARN]", err.message);
 });
 
 const prAnalysisQueue = new Queue("pr-analysis", {
   connection
 });
 
+prAnalysisQueue.on("error", () => {
+  // Handled by connection error listener
+});
+
 module.exports = {
   prAnalysisQueue,
   connection
 };
+
