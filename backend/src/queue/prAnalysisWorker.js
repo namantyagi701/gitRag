@@ -14,26 +14,77 @@ const path = require("path");
 const fs = require("fs");
 require("dotenv").config({ path: path.join(__dirname, "..", "..", ".env") });
 const { Worker } = require("bullmq");
-const { PrismaClient } = require("@prisma/client");
+const prisma = require("../db/prisma");
 const { connection } = require("./prAnalysisQueue");
 const { loadEmbedder } = require("../ingestion/embedder");
 const { ensureLocalClone } = require("../services/repoManager");
-const { collectCodeFiles } = require("../ingestion/fileScanner");
-const { runPass1FileIngestion } = require("../ingestion/passes/pass1Symbols");
-const { runPass2EdgeExtraction } = require("../ingestion/passes/pass2Edges");
-const { runPass3EmbeddingGeneration } = require("../ingestion/passes/pass3Embeddings");
+const { runFullIngestion } = require("../ingestion/runFullIngestion");
 const { processPrDiff } = require("../services/prDiffProcessor");
 const { analyzeImpact } = require("../services/impactAnalyzer");
 const { formatImpactReportMarkdown } = require("../services/reportFormatter");
 const { postImpactComment } = require("../services/githubCommenter");
 
-const prisma = new PrismaClient();
 let embedder = null;
 
 /**
  * Main worker job processor
  */
 async function processJob(job) {
+  // Ensure embedder is loaded if not already initialized
+  if (!embedder) {
+    console.log("[Worker] Loading embedding model (Xenova/all-MiniLM-L6-v2)...");
+    embedder = await loadEmbedder();
+  }
+
+  // ============================================================================
+  // Branch 1: 'ingest-repo' - Initial full codebase ingestion
+  // ============================================================================
+  if (job.name === "ingest-repo") {
+    const { repoId } = job.data;
+    console.log(`\n================================================================================`);
+    console.log(`[Worker] Processing Job ${job.id}: Ingest Repository (ID: ${repoId})`);
+    console.log(`================================================================================\n`);
+
+    const repo = await prisma.repo.findUnique({
+      where: { id: repoId },
+      include: { user: true },
+    });
+
+    if (!repo) {
+      throw new Error(`Repository ID ${repoId} not found in database.`);
+    }
+
+    const localPath = await ensureLocalClone({
+      owner: repo.owner,
+      name: repo.name,
+      accessToken: repo.user?.access_token,
+    });
+
+    let effectiveRepoPath = localPath;
+    if (fs.existsSync(path.join(localPath, "backend"))) {
+      const existingFile = await prisma.file.findFirst({
+        where: { repo_id: repo.id },
+      });
+      if (existingFile && !existingFile.file_path.startsWith("backend/")) {
+        effectiveRepoPath = path.join(localPath, "backend");
+      }
+    }
+
+    console.log(`[Worker] Running full ingestion pipeline on ${effectiveRepoPath}...`);
+    const stats = await runFullIngestion({
+      repoPath: effectiveRepoPath,
+      repoId: repo.id,
+      embedder,
+      prisma,
+    });
+
+    console.log(`\n[Worker] SUCCESS: Full ingestion completed for ${repo.owner}/${repo.name}\n`);
+    return { success: true, repoId: repo.id, repo: `${repo.owner}/${repo.name}`, stats };
+  }
+
+  // ============================================================================
+  // Branch 2: 'analyze-pr' - PR diff analysis and downstream impact report
+  // ============================================================================
   const { owner, name, prNumber, baseSha, headSha, repoUrl } = job.data;
   console.log(`\n================================================================================`);
   console.log(`[Worker] Processing Job ${job.id}: ${owner}/${name} PR #${prNumber}`);
@@ -45,7 +96,8 @@ async function processJob(job) {
   try {
     // 1. Look up repo record (must already exist)
     const repo = await prisma.repo.findFirst({
-      where: { owner, name }
+      where: { owner, name },
+      include: { user: true },
     });
 
     if (!repo) {
@@ -53,13 +105,18 @@ async function processJob(job) {
     }
 
     // 2. Call ensureLocalClone() to get/update local repo path
-    const localPath = await ensureLocalClone({ owner, name, repoUrl });
+    const localPath = await ensureLocalClone({
+      owner,
+      name,
+      repoUrl,
+      accessToken: repo.user?.access_token,
+    });
 
     // Handle subfolder repositories (e.g. 'backend' subfolder for gitRag)
     let effectiveRepoPath = localPath;
     if (fs.existsSync(path.join(localPath, "backend"))) {
       const existingFile = await prisma.file.findFirst({
-        where: { repo_id: repo.id }
+        where: { repo_id: repo.id },
       });
       if (existingFile && !existingFile.file_path.startsWith("backend/")) {
         effectiveRepoPath = path.join(localPath, "backend");
@@ -68,30 +125,12 @@ async function processJob(job) {
 
     // 3. Run full ingestion pipeline
     console.log(`[Worker] Running code ingestion on ${effectiveRepoPath}...`);
-    const files = collectCodeFiles(effectiveRepoPath, effectiveRepoPath);
-    console.log(`[Worker] Found ${files.length} code file(s). Running Pass 1...`);
-
-    // Clean up any files in database that were deleted from disk
-    const existingDbFiles = await prisma.file.findMany({
-      where: { repo_id: repo.id },
-      select: { id: true, file_path: true }
+    await runFullIngestion({
+      repoPath: effectiveRepoPath,
+      repoId: repo.id,
+      embedder,
+      prisma,
     });
-    const currentRelPaths = new Set(files.map((f) => f.relPath));
-    const filesToDelete = existingDbFiles.filter((f) => !currentRelPaths.has(f.file_path));
-    if (filesToDelete.length > 0) {
-      await prisma.file.deleteMany({
-        where: { id: { in: filesToDelete.map((f) => f.id) } }
-      });
-      console.log(`[Worker] Pruned ${filesToDelete.length} stale/deleted file(s) from database.`);
-    }
-
-    await runPass1FileIngestion({ repo, files, prisma });
-
-    console.log(`[Worker] Running Pass 2 (Edge Extraction)...`);
-    await runPass2EdgeExtraction({ repo, files, prisma });
-
-    console.log(`[Worker] Running Pass 3 (Embedding Generation)...`);
-    await runPass3EmbeddingGeneration({ repo, embedder, prisma });
     console.log(`[Worker] Ingestion completed.`);
 
     // 4. Call processPrDiff()

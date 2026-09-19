@@ -1,12 +1,14 @@
 const jwt = require("jsonwebtoken");
+const prisma = require("../db/prisma");
 
 /**
  * Middleware: requireAuth
  * Reads the JWT cookie ('token'), verifies it against SESSION_SECRET,
- * and attaches req.user = { id: payload.userId }.
- * Returns 401 if missing, expired, or invalid.
+ * and queries the database to confirm the user still exists.
+ * Attaches req.user = { id: user.id }.
+ * Returns 401 if missing, expired, invalid, or if user was deleted.
  */
-function requireAuth(req, res, next) {
+async function requireAuth(req, res, next) {
   const token = req.cookies?.token;
 
   if (!token) {
@@ -25,7 +27,16 @@ function requireAuth(req, res, next) {
       return res.status(401).json({ error: "Unauthorized: Invalid token payload" });
     }
 
-    req.user = { id: decoded.userId };
+    const user = await prisma.user.findUnique({
+      where: { id: decoded.userId },
+      select: { id: true },
+    });
+
+    if (!user) {
+      return res.status(401).json({ error: "Unauthorized: User no longer exists" });
+    }
+
+    req.user = { id: user.id };
     next();
   } catch (err) {
     return res.status(401).json({ error: "Unauthorized: Invalid or expired session token" });

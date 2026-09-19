@@ -1,5 +1,10 @@
 require("dotenv").config();
 
+// Ensure BigInt values can be serialized to JSON across all API responses
+BigInt.prototype.toJSON = function () {
+  return this.toString();
+};
+
 const express = require("express");
 const cors = require("cors");
 const { neon } = require("@neondatabase/serverless");

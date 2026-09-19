@@ -1,13 +1,13 @@
-// No auth on these routes yet — anyone who can reach this server can read all repo/PR/impact data. Fine for local dev, must be addressed before any public deployment.
-
 const express = require("express");
 const cors = require("cors");
-const { PrismaClient } = require("@prisma/client");
+const { Octokit } = require("@octokit/rest");
+const prisma = require("../db/prisma");
+const requireAuth = require("../middleware/requireAuth");
+const { prAnalysisQueue } = require("../queue/prAnalysisQueue");
 const { findDependents, findDependencies } = require("../services/dependencyGraph");
 const { groupAndSortImpacts } = require("../services/reportFormatter");
 
 const router = express.Router();
-const prisma = new PrismaClient();
 
 // Permissive CORS enabled for local dev. Must be restricted to specific origin(s) before public deployment.
 router.use(cors());
@@ -34,56 +34,33 @@ function parsePositiveInt(val) {
 }
 
 // ============================================================================
-// 1. GET /repos
-// List all registered repos ordered by created_at DESC.
+// 0. GET /demo/repo
+// Separate unauthenticated route hardcoded to return the one demo repo's data
+// (namantyagi701/gitRag) read-only for public marketing / showcase.
 // ============================================================================
-router.get("/repos", async (req, res) => {
-  try {
-    const repos = await prisma.repo.findMany({
-      orderBy: { created_at: "desc" },
-      select: {
-        id: true,
-        owner: true,
-        name: true,
-        default_branch: true,
-        last_indexed_sha: true,
-        created_at: true
-      }
-    });
-
-    return res.json(repos);
-  } catch (err) {
-    console.error("[API ERROR] GET /repos:", err);
-    return res.status(500).json({ error: "Internal server error" });
-  }
-});
-
-// ============================================================================
-// 2. GET /repos/:owner/:name
-// Get a single repo's details plus basic stats (fileCount, symbolCount, edgeCount).
-// ============================================================================
-router.get("/repos/:owner/:name", async (req, res) => {
-  const { owner, name } = req.params;
+router.get("/demo/repo", async (req, res) => {
+  const owner = "namantyagi701";
+  const name = "gitRag";
 
   try {
     const repo = await prisma.repo.findFirst({
-      where: { owner, name }
+      where: { owner, name },
     });
 
     if (!repo) {
-      return res.status(404).json({ error: "Repository not found" });
+      return res.status(404).json({ error: "Demo repository not found" });
     }
 
     const [fileCount, symbolCount, edgeCount] = await Promise.all([
       prisma.file.count({
-        where: { repo_id: repo.id }
+        where: { repo_id: repo.id },
       }),
       prisma.symbol.count({
-        where: { repo_id: repo.id }
+        where: { repo_id: repo.id },
       }),
       prisma.symbolEdge.count({
-        where: { caller_symbol: { repo_id: repo.id } }
-      })
+        where: { caller_symbol: { repo_id: repo.id } },
+      }),
     ]);
 
     return res.json({
@@ -95,7 +72,307 @@ router.get("/repos/:owner/:name", async (req, res) => {
       created_at: repo.created_at,
       fileCount,
       symbolCount,
-      edgeCount
+      edgeCount,
+    });
+  } catch (err) {
+    console.error("[API ERROR] GET /demo/repo:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ============================================================================
+// 1. GET /repos
+// List all registered repos owned by authenticated user ordered by created_at DESC.
+// ============================================================================
+router.get("/repos", requireAuth, async (req, res) => {
+  try {
+    const repos = await prisma.repo.findMany({
+      where: { user_id: req.user.id },
+      orderBy: { created_at: "desc" },
+      select: {
+        id: true,
+        owner: true,
+        name: true,
+        github_webhook_id: true,
+        default_branch: true,
+        last_indexed_sha: true,
+        created_at: true,
+      },
+    });
+
+    return res.json(repos);
+  } catch (err) {
+    console.error("[API ERROR] GET /repos:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ============================================================================
+// 1.1 GET /repos/available
+// Browse user's GitHub repos where they have admin access, excluding already connected repos.
+// ============================================================================
+router.get("/repos/available", requireAuth, async (req, res) => {
+  try {
+    const user = await prisma.user.findUnique({
+      where: { id: req.user.id },
+      select: { access_token: true },
+    });
+
+    if (!user || !user.access_token) {
+      return res.status(401).json({ error: "GitHub access token missing or user not found" });
+    }
+
+    const octokit = new Octokit({ auth: user.access_token });
+    let page = 1;
+    const per_page = 100;
+    const allRepos = [];
+
+    while (true) {
+      const { data: repos } = await octokit.rest.repos.listForAuthenticatedUser({
+        per_page,
+        page,
+        affiliation: "owner,collaborator,organization_member",
+      });
+
+      allRepos.push(...repos);
+      if (repos.length < per_page) {
+        break;
+      }
+      page++;
+    }
+
+    // Exclude repos that already have a `repos` row in GitRAG (match on owner+name)
+    const existingRepos = await prisma.repo.findMany({
+      select: { owner: true, name: true },
+    });
+    const existingSet = new Set(
+      existingRepos.map((r) => `${r.owner.toLowerCase()}/${r.name.toLowerCase()}`)
+    );
+
+    const available = allRepos
+      .filter((r) => r.permissions && r.permissions.admin)
+      .filter((r) => !existingSet.has(r.full_name.toLowerCase()))
+      .map((r) => ({
+        owner: r.owner.login,
+        name: r.name,
+        full_name: r.full_name,
+        private: r.private,
+        default_branch: r.default_branch || "main",
+      }));
+
+    return res.json(available);
+  } catch (err) {
+    console.error("[API ERROR] GET /repos/available:", err);
+    return res.status(500).json({ error: "Failed to fetch available GitHub repositories" });
+  }
+});
+
+// ============================================================================
+// 1.2 POST /repos/connect
+// Re-verifies admin permission, registers webhook, creates repo row, enqueues ingestion.
+// ============================================================================
+router.post("/repos/connect", requireAuth, async (req, res) => {
+  const { owner, name } = req.body || {};
+
+  if (!owner || !name || typeof owner !== "string" || typeof name !== "string") {
+    return res.status(400).json({ error: "Missing or invalid owner or name in request body" });
+  }
+
+  try {
+    const user = await prisma.user.findUnique({
+      where: { id: req.user.id },
+      select: { access_token: true },
+    });
+
+    if (!user || !user.access_token) {
+      return res.status(401).json({ error: "User access token not found" });
+    }
+
+    // 1. Re-verify admin permission via GitHub API (don't trust frontend)
+    const octokit = new Octokit({ auth: user.access_token });
+    let githubRepo;
+    try {
+      const ghRes = await octokit.rest.repos.get({ owner, repo: name });
+      githubRepo = ghRes.data;
+    } catch (ghErr) {
+      return res.status(404).json({ error: `Repository ${owner}/${name} not found on GitHub` });
+    }
+
+    if (!githubRepo.permissions || !githubRepo.permissions.admin) {
+      return res.status(403).json({ error: "Admin permissions required to connect repository and install webhook" });
+    }
+
+    // 2. Check if a `repos` row already exists for this owner/name
+    const existing = await prisma.repo.findFirst({
+      where: {
+        owner: { equals: owner, mode: "insensitive" },
+        name: { equals: name, mode: "insensitive" },
+      },
+    });
+
+    if (existing) {
+      return res.status(409).json({ error: `Repository ${owner}/${name} is already connected to GitRAG` });
+    }
+
+    // 3. Create the `repos` row
+    let createdRepo;
+    try {
+      createdRepo = await prisma.repo.create({
+        data: {
+          user_id: req.user.id,
+          owner: githubRepo.owner.login,
+          name: githubRepo.name,
+          default_branch: githubRepo.default_branch || "main",
+        },
+      });
+    } catch (createErr) {
+      if (createErr.code === "P2002") {
+        return res.status(409).json({ error: `Repository ${owner}/${name} is already connected` });
+      }
+      throw createErr;
+    }
+
+    // 4. Register real webhook on GitHub
+    const publicBaseUrl = process.env.PUBLIC_BASE_URL || "https://smee.io/hGFM2FpAZE4aCBAN";
+    const webhookUrl = publicBaseUrl.includes("smee.io")
+      ? publicBaseUrl
+      : `${publicBaseUrl.replace(/\/+$/, "")}/webhook/github`;
+
+    try {
+      const hookRes = await octokit.rest.repos.createWebhook({
+        owner: githubRepo.owner.login,
+        repo: githubRepo.name,
+        config: {
+          url: webhookUrl,
+          content_type: "json",
+          secret: process.env.GITHUB_WEBHOOK_SECRET,
+        },
+        events: ["pull_request"],
+      });
+
+      // Store returned webhook id
+      createdRepo = await prisma.repo.update({
+        where: { id: createdRepo.id },
+        data: { github_webhook_id: hookRes.data.id },
+      });
+      console.log(`[Repo Connect] Webhook created for ${owner}/${name}, Hook ID: ${hookRes.data.id}`);
+    } catch (hookErr) {
+      console.error(`[Repo Connect ERROR] Webhook creation failed: ${hookErr.message}. Rolling back repo creation...`);
+      // Rollback created repo row
+      await prisma.repo.delete({ where: { id: createdRepo.id } });
+      return res.status(502).json({
+        error: `Failed to create webhook on GitHub: ${hookErr.message}. Repository connection was rolled back.`,
+      });
+    }
+
+    // 5. Enqueue an 'ingest-repo' job
+    await prAnalysisQueue.add("ingest-repo", { repoId: createdRepo.id });
+    console.log(`[Repo Connect] Enqueued 'ingest-repo' job for repo ID ${createdRepo.id}`);
+
+    // 6. Return created repo row with 201 status
+    return res.status(201).json(createdRepo);
+  } catch (err) {
+    console.error(`[API ERROR] POST /repos/connect (${owner}/${name}):`, err);
+    return res.status(500).json({ error: "Internal server error during repository connection" });
+  }
+});
+
+// ============================================================================
+// 1.3 DELETE /repos/:id
+// Disconnect a repo, delete GitHub webhook, and cascade delete all local data.
+// ============================================================================
+router.delete("/repos/:id", requireAuth, async (req, res) => {
+  const repoId = parseNonNegativeInt(req.params.id);
+  if (repoId === null) {
+    return res.status(404).json({ error: "Repository not found" });
+  }
+
+  try {
+    // 1. Look up repo - return 404 if not found OR if repo.user_id !== req.user.id
+    const repo = await prisma.repo.findUnique({
+      where: { id: repoId },
+    });
+
+    if (!repo || repo.user_id !== req.user.id) {
+      return res.status(404).json({ error: "Repository not found" });
+    }
+
+    // 2. Delete GitHub webhook via Octokit using owner's access_token
+    if (repo.github_webhook_id) {
+      try {
+        const user = await prisma.user.findUnique({
+          where: { id: req.user.id },
+          select: { access_token: true },
+        });
+
+        if (user && user.access_token) {
+          const octokit = new Octokit({ auth: user.access_token });
+          await octokit.rest.repos.deleteWebhook({
+            owner: repo.owner,
+            repo: repo.name,
+            hook_id: repo.github_webhook_id,
+          });
+          console.log(`[Repo DELETE] Webhook ${repo.github_webhook_id} deleted on GitHub for ${repo.owner}/${repo.name}`);
+        }
+      } catch (webhookErr) {
+        // Known limitation: If token is revoked or webhook already manually deleted on GitHub,
+        // log warning but proceed with deleting local data anyway.
+        console.warn(`[Repo DELETE WARN] Failed to delete webhook ${repo.github_webhook_id} on GitHub: ${webhookErr.message}. Proceeding with local deletion.`);
+      }
+    }
+
+    // 3. Delete the repos row (Cascade deletes files, symbols, edges, PRs, impacts)
+    await prisma.repo.delete({
+      where: { id: repo.id },
+    });
+
+    return res.json({ success: true, message: "Repository disconnected successfully" });
+  } catch (err) {
+    console.error(`[API ERROR] DELETE /repos/${repoId}:`, err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ============================================================================
+// 2. GET /repos/:owner/:name
+// Get a single repo's details plus basic stats (fileCount, symbolCount, edgeCount).
+// Scoped to owning user (returns 404 if repo exists but not owned by user).
+// ============================================================================
+router.get("/repos/:owner/:name", requireAuth, async (req, res) => {
+  const { owner, name } = req.params;
+
+  try {
+    const repo = await prisma.repo.findFirst({
+      where: { owner, name },
+    });
+
+    if (!repo || repo.user_id !== req.user.id) {
+      return res.status(404).json({ error: "Repository not found" });
+    }
+
+    const [fileCount, symbolCount, edgeCount] = await Promise.all([
+      prisma.file.count({
+        where: { repo_id: repo.id },
+      }),
+      prisma.symbol.count({
+        where: { repo_id: repo.id },
+      }),
+      prisma.symbolEdge.count({
+        where: { caller_symbol: { repo_id: repo.id } },
+      }),
+    ]);
+
+    return res.json({
+      id: repo.id,
+      owner: repo.owner,
+      name: repo.name,
+      github_webhook_id: repo.github_webhook_id,
+      default_branch: repo.default_branch,
+      last_indexed_sha: repo.last_indexed_sha,
+      created_at: repo.created_at,
+      fileCount,
+      symbolCount,
+      edgeCount,
     });
   } catch (err) {
     console.error(`[API ERROR] GET /repos/${owner}/${name}:`, err);
