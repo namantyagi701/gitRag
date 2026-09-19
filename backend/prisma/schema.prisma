@@ -10,10 +10,26 @@ datasource db {
 }
 
 // ============================================================================
+// 0. Users (GitHub OAuth authenticated users)
+// ============================================================================
+model User {
+  id            Int      @id @default(autoincrement())
+  github_id     BigInt   @unique
+  username      String
+  avatar_url    String?
+  access_token  String   // GitHub OAuth token, used for per-user API calls
+  created_at    DateTime @default(now())
+  repos         Repo[]
+
+  @@map("users")
+}
+
+// ============================================================================
 // 1. Repositories
 // ============================================================================
 model Repo {
   id               Int           @id @default(autoincrement())
+  user_id          Int?
   owner            String
   name             String
   github_id        BigInt?       @unique
@@ -21,6 +37,7 @@ model Repo {
   last_indexed_sha String?       // Commit SHA reflected in the live symbol set
   created_at       DateTime?     @default(now()) @db.Timestamptz()
 
+  user             User?         @relation(fields: [user_id], references: [id], onDelete: Cascade)
   files            File[]
   symbols          Symbol[]
   pull_requests    PullRequest[]
@@ -61,7 +78,7 @@ model Symbol {
   code_body     String
   content_hash  String                       // Hash of code_body; skips re-embedding if unchanged
   embedding     Unsupported("vector(384)")?  // pgvector 384-dim embedding
-  search_vector Unsupported("tsvector")?    // Full-text search vector (see prisma/sql/extensions.sql)
+  search_vector Unsupported("tsvector")?    @default(dbgenerated("(setweight(to_tsvector('english'::regconfig, COALESCE(symbol_name, ''::text)), 'A'::\"char\") || setweight(to_tsvector('english'::regconfig, COALESCE(docstring, ''::text)), 'B'::\"char\"))"))
   updated_at    DateTime?                    @default(now()) @db.Timestamptz()
 
   repo          Repo                         @relation(fields: [repo_id], references: [id], onDelete: Cascade)
